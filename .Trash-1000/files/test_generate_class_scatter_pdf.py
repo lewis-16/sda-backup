@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""
+测试版本：只为前5个class_name生成散点图的PDF文件
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.backends.backend_pdf import PdfPages
+import numpy as np
+from tqdm import tqdm
+import os
+
+def test_generate_class_scatter_pdf():
+    """
+    测试版本：生成包含前5个class_name散点图的PDF文件
+    """
+    # 读取数据
+    print("正在读取数据...")
+    clustering_results = pd.read_csv("/media/ubuntu/sda/visual_stimuli_pattern/dynamic/clustering_results.csv")
+    tsne_features = pd.read_csv("/media/ubuntu/sda/visual_stimuli_pattern/dynamic/tsne_features.csv")
+    
+    # 确保数据对齐
+    assert len(clustering_results) == len(tsne_features), "数据长度不匹配"
+    
+    # 获取前5个唯一的class_name进行测试
+    unique_classes = sorted(clustering_results['class_name'].unique())[:5]
+    print(f"测试版本：生成 {len(unique_classes)} 个类别的散点图")
+    print(f"测试类别: {unique_classes}")
+    
+    # 设置matplotlib参数
+    plt.rcParams['figure.figsize'] = (12, 10)
+    plt.rcParams['font.size'] = 12
+    plt.rcParams['axes.titlesize'] = 16
+    plt.rcParams['axes.labelsize'] = 14
+    
+    # 创建PDF文件
+    output_path = "/media/ubuntu/sda/visual_stimuli_pattern/dynamic/test_class_scatter_plots.pdf"
+    
+    with PdfPages(output_path) as pdf:
+        for i, class_name in enumerate(tqdm(unique_classes, desc="生成测试散点图")):
+            # 创建新图形
+            fig, ax = plt.subplots(figsize=(12, 10))
+            
+            # 获取当前类别的数据
+            current_class_mask = clustering_results['class_name'] == class_name
+            other_class_mask = ~current_class_mask
+            
+            # 绘制其他类别的点（浅灰色）
+            if other_class_mask.sum() > 0:
+                ax.scatter(tsne_features.loc[other_class_mask, 'tSNE1'],
+                          tsne_features.loc[other_class_mask, 'tSNE2'],
+                          c='lightgray', alpha=0.3, s=1, label=f'其他类别 ({other_class_mask.sum()} 个点)')
+            
+            # 绘制当前类别的点（彩色）
+            if current_class_mask.sum() > 0:
+                ax.scatter(tsne_features.loc[current_class_mask, 'tSNE1'],
+                          tsne_features.loc[current_class_mask, 'tSNE2'],
+                          c='red', alpha=0.8, s=3, label=f'{class_name} ({current_class_mask.sum()} 个点)')
+            
+            # 设置图形属性
+            ax.set_xlabel('t-SNE 维度 1', fontsize=14)
+            ax.set_ylabel('t-SNE 维度 2', fontsize=14)
+            ax.set_title(f'类别: {class_name}', fontsize=16, fontweight='bold')
+            ax.legend(fontsize=12)
+            ax.grid(True, alpha=0.3)
+            
+            # 设置坐标轴范围
+            ax.set_xlim(tsne_features['tSNE1'].min() - 5, tsne_features['tSNE1'].max() + 5)
+            ax.set_ylim(tsne_features['tSNE2'].min() - 5, tsne_features['tSNE2'].max() + 5)
+            
+            # 添加统计信息
+            total_points = len(clustering_results)
+            class_points = current_class_mask.sum()
+            percentage = (class_points / total_points) * 100
+            
+            info_text = f'总点数: {total_points:,}\n当前类别点数: {class_points:,}\n占比: {percentage:.2f}%'
+            ax.text(0.02, 0.98, info_text, transform=ax.transAxes, fontsize=10,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            # 保存到PDF
+            pdf.savefig(fig, bbox_inches='tight', dpi=300)
+            plt.close(fig)
+    
+    print(f"\n测试PDF文件已生成: {output_path}")
+    print(f"总共包含 {len(unique_classes)} 页散点图")
+    
+    # 显示文件大小
+    file_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+    print(f"文件大小: {file_size:.2f} MB")
+
+if __name__ == "__main__":
+    test_generate_class_scatter_pdf()
