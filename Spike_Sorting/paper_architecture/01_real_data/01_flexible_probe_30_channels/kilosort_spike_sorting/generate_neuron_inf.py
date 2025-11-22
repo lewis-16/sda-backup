@@ -522,6 +522,19 @@ def deduplicate_neurons(
 def main() -> None:
     setup_logger(verbose=False)
 
+    parser = argparse.ArgumentParser(
+        description="Generate neuron_inf using either registration or deduplication method"
+    )
+    parser.add_argument(
+        "--method",
+        choices=["registration", "dedup"],
+        default="registration",
+        help="Which method to use to generate neuron_inf. Default: registration (use spike registration notebook flow)",
+    )
+    args = parser.parse_args()
+
+    logging.info("Selected neuron_inf generation method: %s", args.method)
+
     base_dir = Path(
         "/media/ubuntu/sda/Spike_Sorting/paper_architecture/01_real_data/01_flexible_probe_30_channels"
     )
@@ -530,7 +543,7 @@ def main() -> None:
     probe_file = Path("/media/ubuntu/sda/data/probe.json")
 
     session_dirs = sorted(
-        p for p in (sorting_root / "sorting_results").iterdir() if p.is_dir()
+        p for p in (sorting_root / "sorting_new").iterdir() if p.is_dir()
     )
     if not session_dirs:
         raise FileNotFoundError(f"No session directories found under {sorting_root}/sorting_results")
@@ -564,236 +577,271 @@ def main() -> None:
             all_cluster_inf = pd.concat(all_cluster_list, ignore_index=True)
             all_spike_inf = pd.concat(all_spike_list, ignore_index=True)
 
-            # ------------------------------------------------------------------
-            # Replicate notebook logic for neuron alignment
-            # ------------------------------------------------------------------
-            all_cluster_inf[["position_1", "position_2"]] = all_cluster_inf.apply(
-                calculate_position, axis=1
-            )
-            all_cluster_inf["Neuron"] = None
-            current_max_neuron = 1
-            if len(all_cluster_inf) > 0:
-                all_cluster_inf.at[0, "Neuron"] = f"Neuron_{current_max_neuron}"
-            for i in range(1, len(all_cluster_inf)):
-                current_pos1 = all_cluster_inf.at[i, "position_1"]
-                current_pos2 = all_cluster_inf.at[i, "position_2"]
-                mask = (
-                    (all_cluster_inf.loc[: i - 1, "position_1"] - current_pos1).abs().lt(3)
-                    & (all_cluster_inf.loc[: i - 1, "position_2"] - current_pos2).abs().lt(5)
+            if args.method == "registration":
+                # ------------------------------------------------------------------
+                # Replicate notebook logic for neuron alignment (registration)
+                # ------------------------------------------------------------------
+                all_cluster_inf[["position_1", "position_2"]] = all_cluster_inf.apply(
+                    calculate_position, axis=1
                 )
-                matched = all_cluster_inf.loc[: i - 1][mask]
-                if not matched.empty and matched["Neuron"].notna().any():
-                    all_cluster_inf.at[i, "Neuron"] = matched["Neuron"].dropna().iloc[-1]
-                else:
-                    current_max_neuron += 1
-                    all_cluster_inf.at[i, "Neuron"] = f"Neuron_{current_max_neuron}"
-
-            neuron_date = pd.crosstab(all_cluster_inf["Neuron"], all_cluster_inf["date"])
-            neuron_date[neuron_date > 1] = 1
-            neuron_date = neuron_date.sum(axis=1)
-            neuron_date = neuron_date[neuron_date == len(replicate_dirs)]
-            neuron_keep = neuron_date.index
-            all_cluster_inf = all_cluster_inf[all_cluster_inf["Neuron"].isin(neuron_keep)].copy()
-            all_cluster_inf["cluster_date"] = (
-                all_cluster_inf["date"] + "_" + all_cluster_inf["cluster"]
-            )
-
-            all_cluster_inf["position_waveform"] = None
-            for idx, row in all_cluster_inf.iterrows():
-                all_cluster_inf.at[idx, "position_waveform"] = calculate_position_waveform(
-                    row, power=2
-                )
-
-            waveform_dict: Dict[str, pd.DataFrame] = {}
-            for neuron_label in all_cluster_inf["Neuron"].unique():
-                temp = all_cluster_inf[all_cluster_inf["Neuron"] == neuron_label]
-                temp = temp.copy()
-                temp.index = temp["cluster_date"]
-                waveform_dict[neuron_label] = temp["position_waveform"].apply(pd.Series)
-
-            num = 0
-            results: Dict[int, np.ndarray] = {}
-            for df in waveform_dict.values():
-                if df.empty:
-                    continue
-                pca = PCA(n_components=2)
-                principal_components = pca.fit_transform(df)
-                dbscan = DBSCAN(eps=3, min_samples=1)
-                dbscan.fit(principal_components)
-
-                label = pd.DataFrame({"labels": dbscan.labels_, "cluster_date": df.index})
-                label["date"] = label["cluster_date"].apply(lambda x: "_".join(x.split("_")[:2]))
-
-                remain_label = label["labels"].value_counts()
-                remain_label = remain_label[remain_label >= len(replicate_dirs)]
-                for lbl in remain_label.index.tolist():
-                    temp_label = label[label["labels"] == lbl]
-                    if temp_label["date"].nunique() != len(replicate_dirs):
-                        remain_label = remain_label.drop(lbl)
-                label = label[label["labels"].isin(remain_label.index)]
-                for lbl in label["labels"].unique():
-                    results[num] = label.loc[label["labels"] == lbl, "cluster_date"].values
-                    num += 1
-
-            all_cluster_inf["Neuron"] = None
-            for key, item in results.items():
-                all_cluster_inf.loc[
-                    all_cluster_inf["cluster_date"].isin(item), "Neuron"
-                ] = f"Neuron_{key + 1}"
-
-            all_cluster_inf = all_cluster_inf.dropna(subset=["Neuron"]).copy()
-            all_cluster_inf["neuron_date"] = all_cluster_inf["date"] + "_" + all_cluster_inf["Neuron"]
-
-            waveform_mean = pd.DataFrame()
-            for df in waveform_dict.values():
-                waveform_mean = pd.concat((waveform_mean, df), axis=0)
-            waveform_mean = waveform_mean.loc[list(all_cluster_inf["cluster_date"])]
-
-            all_cluster_inf = all_cluster_inf.set_index("cluster_date")
-            all_cluster_inf = all_cluster_inf.join(waveform_mean, how="right")
-            all_cluster_inf["cluster_date"] = all_cluster_inf.index
-
-            all_spike_inf["cluster_date"] = all_spike_inf["date"] + "_" + all_spike_inf["cluster"]
-            all_spike_inf = all_spike_inf[
-                all_spike_inf["cluster_date"].isin(all_cluster_inf["cluster_date"])
-            ].copy()
-            all_spike_inf["Neuron"] = None
-            for i in range(len(all_cluster_inf)):
-                cluster_date = all_cluster_inf.iloc[i]["cluster_date"]
-                neuron_label = all_cluster_inf.iloc[i]["Neuron"]
-                all_spike_inf.loc[
-                    all_spike_inf["cluster_date"] == cluster_date, "Neuron"
-                ] = neuron_label
-
-            reference_date = "1"
-            all_cluster_inf_rep1 = all_cluster_inf[all_cluster_inf["date"] == reference_date].copy()
-            all_spike_inf_rep1 = all_spike_inf[all_spike_inf["date"] == reference_date].copy()
-
-            del_neuron = all_spike_inf_rep1["Neuron"].value_counts()
-            del_neuron = del_neuron[del_neuron < 8000].index
-            all_cluster_inf_rep1 = all_cluster_inf_rep1[
-                ~all_cluster_inf_rep1["Neuron"].isin(del_neuron)
-            ].copy()
-
-            all_cluster_inf_rep1["channel_id"] = None
-            for index, row in all_cluster_inf_rep1.iterrows():
-                probe_group = row["probe_group"]
-                if probe_group in CHANNEL_INDICES:
-                    all_cluster_inf_rep1.at[index, "channel_id"] = CHANNEL_INDICES[probe_group]
-
-            waveform_matrix = recording.get_traces().astype("float32")
-            all_spike_inf_rep1 = all_spike_inf_rep1[
-                all_spike_inf_rep1["time"] < waveform_matrix.shape[0] - 35
-            ].copy()
-
-            if "waveform" not in all_cluster_inf_rep1.columns:
-                all_cluster_inf_rep1["waveform"] = [None] * len(all_cluster_inf_rep1)
-
-            for i in range(len(all_cluster_inf_rep1)):
-                neuron_label = all_cluster_inf_rep1["Neuron"].values[i]
-                channel_id = all_cluster_inf_rep1["channel_id"].values[i]
-                if channel_id is None:
-                    continue
-
-                spike_temp = all_spike_inf_rep1[all_spike_inf_rep1["Neuron"] == neuron_label]
-                if spike_temp.empty:
-                    continue
-
-                waveform_temp = waveform_matrix[:, channel_id].T
-                n = len(spike_temp)
-                n_channels = len(channel_id)
-                waveform_length = 61
-
-                waveform_stack = np.zeros((n, n_channels, waveform_length)).astype(np.float32)
-
-                for j in range(n):
-                    start = spike_temp["time"].values[j] - 30
-                    end = spike_temp["time"].values[j] + 31
-                    waveform_stack[i, :, :] += waveform_temp[:, start:end]
-
-                waveform_mean_temp = np.mean(waveform_stack, axis=0)
-                all_cluster_inf_rep1["waveform"].values[i] = waveform_mean_temp.T
-
-            all_cluster_inf_rep1["position_waveform"] = None
-            for idx, row in all_cluster_inf_rep1.iterrows():
-                all_cluster_inf_rep1.at[idx, "position_waveform"] = calculate_position_waveform(
-                    row, power=2
-                )
-
-            neuron_inf_records = []
-            for neuron_label in all_cluster_inf_rep1["Neuron"].unique():
-                temp = all_cluster_inf_rep1[all_cluster_inf_rep1["Neuron"] == neuron_label]
-                if len(temp) > 1:
-                    neuron_inf_records.append(
-                        [
-                            neuron_label,
-                            np.mean(temp["position_1"]),
-                            np.mean(temp["position_2"]),
-                            np.mean(list(temp["position_waveform"]), axis=0),
-                            temp["channel_id"].iloc[0],
-                            np.stack(temp["waveform"].values).mean(axis=0),
-                            temp["cluster"].values[0],
-                            temp["probe_group"].values[0],
-                        ]
+                all_cluster_inf["Neuron"] = None
+                current_max_neuron = 1
+                if len(all_cluster_inf) > 0:
+                    all_cluster_inf.at[0, "Neuron"] = f"Neuron_{current_max_neuron}"
+                for i in range(1, len(all_cluster_inf)):
+                    current_pos1 = all_cluster_inf.at[i, "position_1"]
+                    current_pos2 = all_cluster_inf.at[i, "position_2"]
+                    mask = (
+                        (all_cluster_inf.loc[: i - 1, "position_1"] - current_pos1).abs().lt(3)
+                        & (all_cluster_inf.loc[: i - 1, "position_2"] - current_pos2).abs().lt(5)
                     )
-                else:
-                    neuron_inf_records.append(
-                        [
-                            neuron_label,
-                            temp["position_1"].iloc[0],
-                            temp["position_2"].iloc[0],
-                            temp["position_waveform"].iloc[0],
-                            temp["channel_id"].iloc[0],
-                            temp["waveform"].values[0],
-                            temp["cluster"].values[0],
-                            temp["probe_group"].values[0],
-                        ]
+                    matched = all_cluster_inf.loc[: i - 1][mask]
+                    if not matched.empty and matched["Neuron"].notna().any():
+                        all_cluster_inf.at[i, "Neuron"] = matched["Neuron"].dropna().iloc[-1]
+                    else:
+                        current_max_neuron += 1
+                        all_cluster_inf.at[i, "Neuron"] = f"Neuron_{current_max_neuron}"
+
+                neuron_date = pd.crosstab(all_cluster_inf["Neuron"], all_cluster_inf["date"])
+                neuron_date[neuron_date > 1] = 1
+                neuron_date = neuron_date.sum(axis=1)
+                neuron_date = neuron_date[neuron_date == len(replicate_dirs)]
+                neuron_keep = neuron_date.index
+                all_cluster_inf = all_cluster_inf[all_cluster_inf["Neuron"].isin(neuron_keep)].copy()
+                all_cluster_inf["cluster_date"] = (
+                    all_cluster_inf["date"] + "_" + all_cluster_inf["cluster"]
+                )
+
+                all_cluster_inf["position_waveform"] = None
+                for idx, row in all_cluster_inf.iterrows():
+                    all_cluster_inf.at[idx, "position_waveform"] = calculate_position_waveform(
+                        row, power=2
                     )
 
-            if neuron_inf_records:
-                neuron_inf = pd.DataFrame(
-                    neuron_inf_records,
-                    columns=[
-                        "Neuron",
-                        "position_1",
-                        "position_2",
-                        "position_waveform",
-                        "channel_id",
-                        "channel_waveform",
-                        "cluster",
-                        "probe_group",
-                    ],
+                waveform_dict: Dict[str, pd.DataFrame] = {}
+                for neuron_label in all_cluster_inf["Neuron"].unique():
+                    temp = all_cluster_inf[all_cluster_inf["Neuron"] == neuron_label]
+                    temp = temp.copy()
+                    temp.index = temp["cluster_date"]
+                    waveform_dict[neuron_label] = temp["position_waveform"].apply(pd.Series)
+
+                num = 0
+                results: Dict[int, np.ndarray] = {}
+                for df in waveform_dict.values():
+                    if df.empty:
+                        continue
+                    pca = PCA(n_components=2)
+                    principal_components = pca.fit_transform(df)
+                    dbscan = DBSCAN(eps=3, min_samples=1)
+                    dbscan.fit(principal_components)
+
+                    label = pd.DataFrame({"labels": dbscan.labels_, "cluster_date": df.index})
+                    label["date"] = label["cluster_date"].apply(lambda x: "_".join(x.split("_")[:2]))
+
+                    remain_label = label["labels"].value_counts()
+                    remain_label = remain_label[remain_label >= len(replicate_dirs)]
+                    for lbl in remain_label.index.tolist():
+                        temp_label = label[label["labels"] == lbl]
+                        if temp_label["date"].nunique() != len(replicate_dirs):
+                            remain_label = remain_label.drop(lbl)
+                    label = label[label["labels"].isin(remain_label.index)]
+                    for lbl in label["labels"].unique():
+                        results[num] = label.loc[label["labels"] == lbl, "cluster_date"].values
+                        num += 1
+
+                all_cluster_inf["Neuron"] = None
+                for key, item in results.items():
+                    all_cluster_inf.loc[
+                        all_cluster_inf["cluster_date"].isin(item), "Neuron"
+                    ] = f"Neuron_{key + 1}"
+
+                all_cluster_inf = all_cluster_inf.dropna(subset=["Neuron"]).copy()
+                all_cluster_inf["neuron_date"] = all_cluster_inf["date"] + "_" + all_cluster_inf["Neuron"]
+
+                waveform_mean = pd.DataFrame()
+                for df in waveform_dict.values():
+                    waveform_mean = pd.concat((waveform_mean, df), axis=0)
+                waveform_mean = waveform_mean.loc[list(all_cluster_inf["cluster_date"])]
+
+                all_cluster_inf = all_cluster_inf.set_index("cluster_date")
+                all_cluster_inf = all_cluster_inf.join(waveform_mean, how="right")
+                all_cluster_inf["cluster_date"] = all_cluster_inf.index
+
+                all_spike_inf["cluster_date"] = all_spike_inf["date"] + "_" + all_spike_inf["cluster"]
+                all_spike_inf = all_spike_inf[
+                    all_spike_inf["cluster_date"].isin(all_cluster_inf["cluster_date"])
+                ].copy()
+                all_spike_inf["Neuron"] = None
+                for i in range(len(all_cluster_inf)):
+                    cluster_date = all_cluster_inf.iloc[i]["cluster_date"]
+                    neuron_label = all_cluster_inf.iloc[i]["Neuron"]
+                    all_spike_inf.loc[
+                        all_spike_inf["cluster_date"] == cluster_date, "Neuron"
+                    ] = neuron_label
+
+                reference_date = "1"
+                all_cluster_inf_rep1 = all_cluster_inf[all_cluster_inf["date"] == reference_date].copy()
+                all_spike_inf_rep1 = all_spike_inf[all_spike_inf["date"] == reference_date].copy()
+
+                del_neuron = all_spike_inf_rep1["Neuron"].value_counts()
+                del_neuron = del_neuron[del_neuron < 8000].index
+                all_cluster_inf_rep1 = all_cluster_inf_rep1[
+                    ~all_cluster_inf_rep1["Neuron"].isin(del_neuron)
+                ].copy()
+
+                all_cluster_inf_rep1["channel_id"] = None
+                for index, row in all_cluster_inf_rep1.iterrows():
+                    probe_group = row["probe_group"]
+                    if probe_group in CHANNEL_INDICES:
+                        all_cluster_inf_rep1.at[index, "channel_id"] = CHANNEL_INDICES[probe_group]
+
+                waveform_matrix = recording.get_traces().astype("float32")
+                all_spike_inf_rep1 = all_spike_inf_rep1[
+                    all_spike_inf_rep1["time"] < waveform_matrix.shape[0] - 35
+                ].copy()
+
+                if "waveform" not in all_cluster_inf_rep1.columns:
+                    all_cluster_inf_rep1["waveform"] = [None] * len(all_cluster_inf_rep1)
+
+                for i in range(len(all_cluster_inf_rep1)):
+                    neuron_label = all_cluster_inf_rep1["Neuron"].values[i]
+                    channel_id = all_cluster_inf_rep1["channel_id"].values[i]
+                    if channel_id is None:
+                        continue
+
+                    spike_temp = all_spike_inf_rep1[all_spike_inf_rep1["Neuron"] == neuron_label]
+                    if spike_temp.empty:
+                        continue
+
+                    waveform_temp = waveform_matrix[:, channel_id].T
+                    n = len(spike_temp)
+                    n_channels = len(channel_id)
+                    waveform_length = 61
+
+                    waveform_stack = np.zeros((n, n_channels, waveform_length)).astype(np.float32)
+
+                    for j in range(n):
+                        start = spike_temp["time"].values[j] - 30
+                        end = spike_temp["time"].values[j] + 31
+                        waveform_stack[i, :, :] += waveform_temp[:, start:end]
+
+                    waveform_mean_temp = np.mean(waveform_stack, axis=0)
+                    all_cluster_inf_rep1["waveform"].values[i] = waveform_mean_temp.T
+
+                all_cluster_inf_rep1["position_waveform"] = None
+                for idx, row in all_cluster_inf_rep1.iterrows():
+                    all_cluster_inf_rep1.at[idx, "position_waveform"] = calculate_position_waveform(
+                        row, power=2
+                    )
+
+                neuron_inf_records = []
+                for neuron_label in all_cluster_inf_rep1["Neuron"].unique():
+                    temp = all_cluster_inf_rep1[all_cluster_inf_rep1["Neuron"] == neuron_label]
+                    if len(temp) > 1:
+                        neuron_inf_records.append(
+                            [
+                                neuron_label,
+                                np.mean(temp["position_1"]),
+                                np.mean(temp["position_2"]),
+                                np.mean(list(temp["position_waveform"]), axis=0),
+                                temp["channel_id"].iloc[0],
+                                np.stack(temp["waveform"].values).mean(axis=0),
+                                temp["cluster"].values[0],
+                                temp["probe_group"].values[0],
+                            ]
+                        )
+                    else:
+                        neuron_inf_records.append(
+                            [
+                                neuron_label,
+                                temp["position_1"].iloc[0],
+                                temp["position_2"].iloc[0],
+                                temp["position_waveform"].iloc[0],
+                                temp["channel_id"].iloc[0],
+                                temp["waveform"].values[0],
+                                temp["cluster"].values[0],
+                                temp["probe_group"].values[0],
+                            ]
+                        )
+
+                if neuron_inf_records:
+                    neuron_inf = pd.DataFrame(
+                        neuron_inf_records,
+                        columns=[
+                            "Neuron",
+                            "position_1",
+                            "position_2",
+                            "position_waveform",
+                            "channel_id",
+                            "channel_waveform",
+                            "cluster",
+                            "probe_group",
+                        ],
+                    )
+                else:
+                    neuron_inf = pd.DataFrame(
+                        columns=[
+                            "Neuron",
+                            "position_1",
+                            "position_2",
+                            "position_waveform",
+                            "channel_id",
+                            "channel_waveform",
+                            "cluster",
+                            "probe_group",
+                        ]
+                    )
+
+                neuron_inf = deduplicate_neurons(
+                    neuron_inf,
+                    position_threshold=10.0,
+                    waveform_threshold=0.95,
+                )
+
+                output_path = session_dir / "neuron_inf.pkl"
+                with open(output_path, "wb") as f:
+                    pickle.dump(neuron_inf, f)
+
+                logging.info(
+                    "Session %s complete. Saved %d neurons to %s",
+                    session_dir.name,
+                    len(neuron_inf),
+                    output_path,
                 )
             else:
-                neuron_inf = pd.DataFrame(
-                    columns=[
-                        "Neuron",
-                        "position_1",
-                        "position_2",
-                        "position_waveform",
-                        "channel_id",
-                        "channel_waveform",
-                        "cluster",
-                        "probe_group",
-                    ]
+                # ------------------------------------------------------------------
+                # Alternative dedup flow (modular): assign initial neuron ids, filter
+                # by presence across days, compute position waveforms, refine,
+                # compute reference waveforms and build neuron inf, then deduplicate
+                # ------------------------------------------------------------------
+                all_cluster_inf = assign_initial_neuron_ids(all_cluster_inf)
+                all_cluster_inf = filter_neurons_present_all_days(all_cluster_inf)
+                all_cluster_inf = compute_position_waveforms(all_cluster_inf)
+                all_cluster_inf = refine_with_dbscan(all_cluster_inf)
+
+                # map spikes to Neuron labels
+                all_spike_inf["cluster_date"] = all_spike_inf["date"] + "_" + all_spike_inf["cluster"]
+                all_cluster_inf["cluster_date"] = all_cluster_inf["date"] + "_" + all_cluster_inf["cluster"]
+                all_spike_inf = all_spike_inf[all_spike_inf["cluster_date"].isin(all_cluster_inf["cluster_date"])].copy()
+                all_spike_inf["Neuron"] = None
+                for idx, row in all_cluster_inf.iterrows():
+                    all_spike_inf.loc[all_spike_inf["cluster_date"] == row["cluster_date"], "Neuron"] = row["Neuron"]
+
+                reference_date = "1"
+                cluster_ref = compute_reference_waveforms(recording, all_cluster_inf, all_spike_inf, reference_date)
+                neuron_inf = build_neuron_inf(cluster_ref)
+                neuron_inf = deduplicate_neurons(neuron_inf, position_threshold=10.0, waveform_threshold=0.95)
+
+                output_path = session_dir / "neuron_inf.pkl"
+                with open(output_path, "wb") as f:
+                    pickle.dump(neuron_inf, f)
+
+                logging.info(
+                    "Session %s complete (dedup). Saved %d neurons to %s",
+                    session_dir.name,
+                    len(neuron_inf),
+                    output_path,
                 )
-
-            neuron_inf = deduplicate_neurons(
-                neuron_inf,
-                position_threshold=10.0,
-                waveform_threshold=0.95,
-            )
-
-            output_path = session_dir / "neuron_inf.pkl"
-            with open(output_path, "wb") as f:
-                pickle.dump(neuron_inf, f)
-
-            logging.info(
-                "Session %s complete. Saved %d neurons to %s",
-                session_dir.name,
-                len(neuron_inf),
-                output_path,
-            )
         except Exception as exc:  # pylint: disable=broad-except
             logging.exception("Failed to process session %s: %s", session_dir.name, exc)
 

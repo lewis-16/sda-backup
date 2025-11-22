@@ -45,6 +45,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.data import Subset
+from scipy.signal import find_peaks
 
 # from function.Function import *
 
@@ -70,10 +71,11 @@ def count_array2_in_range_of_array1(array1, array2, threshold=5):
     return count
 
 
-def detect_local_minimum_in_window(data, window_size=20, std_multiplier=2):
+def detect_local_minimum_in_window(data, window_size=20, std_multiplier=2, min_distance=None):
 
     """
-    在每个滑动窗口范围内检测局部最小值的索引，并确保最小值低于 mean - std_multiplier * std。
+    使用 scipy.signal.find_peaks 在每个滑动窗口范围内检测局部最小值的索引，
+    并确保最小值低于 mean - std_multiplier * std。每个窗口内只保留一个检测值。
 
     参数:
     data : numpy.ndarray
@@ -82,33 +84,62 @@ def detect_local_minimum_in_window(data, window_size=20, std_multiplier=2):
         滑动窗口的大小，用于定义局部范围，默认为 20。
     std_multiplier : float
         标准差的倍数，用于筛选局部最小值，默认为 2。
+    min_distance : int, optional
+        峰值之间的最小距离（采样点数）。如果为 None，则使用 window_size // 2。
 
     返回:
-    local_minima_indices : list of numpy.ndarray
-        每行局部最小值的索引列表，每个元素是对应行局部最小值的索引数组。
+    local_minima_indices : list
+        所有通道局部最小值的索引列表（已去重）。
     """
+    if min_distance is None:
+        min_distance = max(1, window_size // 2)
+    
     local_minima_indices = []
 
     for row in data:
-        minima_indices = []
         row = row.astype(np.float32)
         row_mean = np.mean(row)
         row_std = np.std(row)
         threshold = row_mean - std_multiplier * row_std
-
+        
+        # 反转信号以检测最小值（find_peaks 检测最大值）
+        inverted_row = -row
+        
+        # 使用 find_peaks 检测峰值（对应原信号的最小值）
+        # height: 峰值必须高于此值（对于反转信号，即原信号必须低于 -threshold）
+        # distance: 峰值之间的最小距离
+        peaks, _ = find_peaks(
+            inverted_row,
+            height=-threshold,  # 反转后的阈值
+            distance=min_distance
+        )
+        
+        # 在每个滑动窗口内只保留一个峰值
+        windowed_peaks = []
         for start in range(0, len(row), window_size):
             end = min(start + window_size, len(row))
-            window = row[start:end]
             
-            if len(window) > 0:
-                local_min_index = np.argmin(window)
-                local_min_value = window[local_min_index]
+            # 找到在当前窗口内的所有峰值
+            window_peaks = peaks[(peaks >= start) & (peaks < end)]
+            
+            if len(window_peaks) > 0:
+                # 如果窗口内有多个峰值，选择最显著的（即原信号中最小值最小的）
+                if len(window_peaks) > 1:
+                    # 找到原信号中值最小的峰值
+                    peak_values = row[window_peaks]
+                    min_peak_idx = np.argmin(peak_values)
+                    selected_peak = window_peaks[min_peak_idx]
+                else:
+                    selected_peak = window_peaks[0]
                 
-                if local_min_value < threshold:
-                    minima_indices.append(start + local_min_index)  
+                # 验证是否满足阈值条件
+                if row[selected_peak] < threshold:
+                    windowed_peaks.append(int(selected_peak))
         
-        local_minima_indices.extend(minima_indices)
-        local_minima_indices = list(set(local_minima_indices))  
+        local_minima_indices.extend(windowed_peaks)
+    
+    # 去重并排序
+    local_minima_indices = sorted(list(set(local_minima_indices)))
 
     return local_minima_indices
 
@@ -156,7 +187,7 @@ def cluster_label_array1_based_on_array2(array1, array2, threshold=5):
     return labels
 
 
-def label_array1_based_on_array2(array1, array2, threshold=5):
+def label_array1_based_on_array2(array1, array2, threshold=5, use_nearest_neighbor=True):
 
     """
     根据 array2 的值对 array1 进行标记。
@@ -164,35 +195,75 @@ def label_array1_based_on_array2(array1, array2, threshold=5):
     
     参数:
     array1 : numpy.ndarray
-        要标记的数组。
+        要标记的数组（检测到的spike时间点）。
     array2 : numpy.ndarray
-        用于判断的数组。
+        用于判断的数组（ground truth spike时间点）。
     threshold : int
-        判断范围的阈值。
+        判断范围的阈值（采样点数）。建议使用较小的值（0-2）以避免相邻waveform被重复标记。
+    use_nearest_neighbor : bool
+        如果为 True，使用最近邻匹配策略，确保每个ground truth spike最多只匹配一个检测spike。
+        这可以避免相邻waveform被重复标记的问题。默认为 True。
     
     返回:
     labels : numpy.ndarray
         长度为 len(array1) 的标签数组，值为 0 或 1。
     """
-    # 对 array2 进行排序以加速搜索
-    sorted_array2 = np.sort(array2)
+    array1 = np.array(array1)
+    array2 = np.array(array2)
     
     # 初始化标签数组，默认值为 0
     labels = np.zeros(len(array1), dtype=int)
     
-    # 遍历 array1 中的每个元素
-    for i, value in enumerate(array1):
-        # 计算当前值的范围
-        left = value - threshold
-        right = value + threshold
+    if len(array2) == 0:
+        return labels
+    
+    if use_nearest_neighbor:
+        # 使用最近邻匹配策略：确保每个ground truth spike最多只匹配一个检测spike
+        # 对 array2 进行排序以加速搜索
+        sorted_array2 = np.sort(array2)
         
-        # 使用二分搜索判断范围内是否存在值
-        left_index = np.searchsorted(sorted_array2, left, side='left')
-        right_index = np.searchsorted(sorted_array2, right, side='right')
+        # 记录每个ground truth spike是否已被匹配
+        matched_gt_indices = set()
         
-        # 如果范围内存在值，则标记为 1
-        if right_index > left_index:
-            labels[i] = 1
+        # 对 array1 按值排序，以便优先匹配更接近的spike
+        sorted_indices = np.argsort(array1)
+        
+        # 对于每个检测到的spike，找到最近的ground truth spike
+        for idx in sorted_indices:
+            value = array1[idx]
+            
+            # 找到最近的ground truth spike
+            nearest_idx = np.searchsorted(sorted_array2, value, side='left')
+            
+            # 检查左右两个候选位置
+            candidates = []
+            if nearest_idx > 0:
+                candidates.append((nearest_idx - 1, sorted_array2[nearest_idx - 1]))
+            if nearest_idx < len(sorted_array2):
+                candidates.append((nearest_idx, sorted_array2[nearest_idx]))
+            
+            # 找到距离最近的候选
+            if candidates:
+                best_idx, best_value = min(candidates, key=lambda x: abs(x[1] - value))
+                distance = abs(best_value - value)
+                
+                # 如果距离在阈值内且该ground truth spike未被匹配
+                if distance <= threshold and best_idx not in matched_gt_indices:
+                    labels[idx] = 1
+                    matched_gt_indices.add(best_idx)
+    else:
+        # 原始策略：简单的范围匹配（可能一个ground truth匹配多个检测spike）
+        sorted_array2 = np.sort(array2)
+        
+        for i, value in enumerate(array1):
+            left = value - threshold
+            right = value + threshold
+            
+            left_index = np.searchsorted(sorted_array2, left, side='left')
+            right_index = np.searchsorted(sorted_array2, right, side='right')
+            
+            if right_index > left_index:
+                labels[i] = 1
     
     return labels
 
@@ -297,7 +368,14 @@ def main():
     all_valid_indices = []
     all_windows = []
 
-    for start_frame in range(0, total_frames, chunk_size):
+    # 计算总chunk数用于进度条
+    total_chunks = (total_frames + chunk_size - 1) // chunk_size
+    print(f"[INFO] Processing {total_chunks} chunks...")
+    
+    for start_frame in tqdm(range(0, total_frames, chunk_size), 
+                             desc="Detecting spikes", 
+                             unit="chunk",
+                             total=total_chunks):
         end_frame = min(start_frame + chunk_size, total_frames)
 
         data_chunk = recording_f.get_traces(
@@ -307,8 +385,8 @@ def main():
 
         threshold_result = detect_local_minimum_in_window(
             data_chunk.T,
-            std_multiplier=3.5,
-            window_size= 30
+            std_multiplier=2.4,
+            window_size=10
         )
 
         threshold_result = np.array(threshold_result) + start_frame
