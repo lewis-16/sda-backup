@@ -933,11 +933,20 @@ def prepare_training_data(
     # Convert time from seconds to sample indices
     sampling_rate = recording_f.get_sampling_frequency()
     gt_detect_array_filtered = gt_detect_array[gt_detect_array['time'] < max_frames].copy()
+    print(f"Filtered gt_detect_array: {len(gt_detect_array_filtered)} spikes (out of {len(gt_detect_array)} total)")
+    
+    # Debug: print probe_to_clique_index keys and sample extremum_channels
+    print(f"Recording clique channel IDs (keys in probe_to_clique_index): {list(probe_to_clique_index.keys())[:10]}...")
+    if len(gt_detect_array_filtered) > 0:
+        sample_extremum_channels = gt_detect_array_filtered['extremum_channel'].dropna().unique()[:10]
+        print(f"Sample extremum_channels from gt_detect_array: {list(sample_extremum_channels)}")
     
     # Build mapping from extremum_channel to clique column index
     spike_train_all = []
     y_unit_id = []
     gt_ch = []
+    skipped_count = 0
+    skipped_reasons = {'na': 0, 'not_in_mapping': 0}
     
     for pos_idx, (_, row) in enumerate(gt_detect_array_filtered.iterrows()):
         extremum_channel = row['extremum_channel']
@@ -949,21 +958,41 @@ def prepare_training_data(
         
         # Map extremum_channel (original probe channel ID) to clique column index
         if pd.isna(extremum_channel) or extremum_channel is None:
+            skipped_reasons['na'] += 1
             continue
         
-        # extremum_channel can be string (e.g., "A-000") or integer
-        if extremum_channel not in probe_to_clique_index:
-            # This spike's extremum_channel is not in the clique, skip
+        # Convert extremum_channel to string if it's not already, to ensure type matching
+        extremum_channel_str = str(extremum_channel)
+        
+        # Try both the original value and string version
+        if extremum_channel not in probe_to_clique_index and extremum_channel_str not in probe_to_clique_index:
+            skipped_reasons['not_in_mapping'] += 1
+            skipped_count += 1
             continue
         
-        clique_channel_index = probe_to_clique_index[extremum_channel]
+        # Use whichever version is in the mapping
+        if extremum_channel in probe_to_clique_index:
+            clique_channel_index = probe_to_clique_index[extremum_channel]
+        else:
+            clique_channel_index = probe_to_clique_index[extremum_channel_str]
         
         spike_train_all.append(spike_time_sample)
         y_unit_id.append(unit_id)
         gt_ch.append(clique_channel_index)  # 使用clique列索引
     
-    gt_array = np.array([spike_train_all, gt_ch]).T
+    gt_array = np.array([spike_train_all, gt_ch]).T if len(spike_train_all) > 0 else np.array([]).reshape(0, 2)
     print(f"GT spike count: {len(gt_array)}")
+    if skipped_count > 0:
+        print(f"Skipped {skipped_count} spikes: {skipped_reasons}")
+    
+    # Check if gt_array is empty
+    if len(gt_array) == 0:
+        raise ValueError(
+            f"gt_array is empty! This means no extremum_channels from gt_detect_array "
+            f"could be mapped to recording_clique channel IDs. "
+            f"Recording clique channel IDs: {list(probe_to_clique_index.keys())}, "
+            f"Sample extremum_channels from gt_detect_array: {list(gt_detect_array_filtered['extremum_channel'].dropna().unique()[:10])}"
+        )
     
     # Use AutoSort's map_gt_annotation function
     gt_label_array1 = map_gt_annotation(detect_array, gt_array)
@@ -1865,6 +1894,80 @@ def match_neurons(
 
 
 
+def compute_position_waveform_from_average(
+    per_channel_waveform: np.ndarray,
+    channel_id: list,
+    channel_positions: dict,
+    window_size: int = 30,
+) -> tuple:
+    """
+    Compute position and position_waveform from a single average per_channel_waveform
+    
+    Parameters:
+        per_channel_waveform: numpy array, shape (n_timepoints, n_channels) = (window_size, n_channels)
+        channel_id: list of channel IDs (clique内的索引，0-based)
+        channel_positions: dict, 键为channel索引（clique内的索引），值为(x, y)位置元组
+        window_size: window size, default 30
+    
+    Returns:
+        position_1, position_2, position_waveform (window_size-dim)
+    """
+    # Extract channels corresponding to channel_id
+    # per_channel_waveform shape: (window_size, n_channels)
+    # Extract columns for channel_id: (window_size, n_valid_channels)
+    waveform_subset = per_channel_waveform[:, channel_id]  # (window_size, n_valid_channels)
+    # Transpose to (n_valid_channels, window_size) for easier calculation
+    snippet = waveform_subset.T  # (n_valid_channels, window_size)
+    
+    # Calculate position of this average waveform (based on channel_id channels)
+    a_squared = [np.sum(snippet[j, :]**2) for j in range(len(channel_id))]
+    
+    sum_x_a = 0
+    sum_y_a = 0
+    sum_a = 0
+    
+    for j, ch_idx in enumerate(channel_id):
+        x_i, y_i = channel_positions.get(ch_idx, (0, 0))
+        a_i_sq = a_squared[j]
+        sum_x_a += x_i * a_i_sq
+        sum_y_a += y_i * a_i_sq
+        sum_a += a_i_sq
+    
+    if sum_a == 0:
+        return 0.0, 0.0, np.zeros(window_size, dtype=np.float32)
+    
+    spike_x = sum_x_a / sum_a
+    spike_y = sum_y_a / sum_a
+    
+    # Calculate position_waveform (based on spike position and channel_id channels)
+    distances = []
+    for ch_idx in channel_id:
+        x_channel, y_channel = channel_positions.get(ch_idx, (np.nan, np.nan))
+        if not (np.isnan(x_channel) or np.isnan(y_channel)):
+            distance = np.sqrt((spike_x - x_channel)**2 + (spike_y - y_channel)**2)
+            distances.append(distance)
+        else:
+            distances.append(np.inf)
+    
+    if not distances or all(d == np.inf for d in distances):
+        return spike_x, spike_y, np.zeros(window_size, dtype=np.float32)
+    
+    distances = np.array(distances, dtype=np.float32)
+    
+    # Calculate position_waveform using IDW interpolation
+    weights = 1.0 / (np.power(distances, 2, dtype=np.float32) + 1e-10)
+    if np.any(distances == 0):
+        zero_idx = np.where(distances == 0)[0][0]
+        spike_position_waveform = snippet[zero_idx, :].astype(np.float32)
+    else:
+        weights /= weights.sum()
+        spike_position_waveform = np.zeros(window_size, dtype=np.float32)
+        for t in range(window_size):
+            spike_position_waveform[t] = float(np.dot(snippet[:, t], weights))
+    
+    return spike_x, spike_y, spike_position_waveform
+
+
 def compute_cluster_position_waveform(
     snippets: np.ndarray,
     channel_id: list,
@@ -1961,6 +2064,7 @@ def calibration_model(
     waveform_similarity_threshold: float = 0.9,
     eval_neuron_inf: pd.DataFrame = None,
     gt_detect_array: pd.DataFrame = None,
+    match_mode: str = 'per_channel_match',
     device=None,
 ):
     """
@@ -1986,6 +2090,9 @@ def calibration_model(
         waveform_similarity_threshold: waveform similarity threshold，default 0.9
         eval_neuron_inf: evaluation data neuron_inf DataFrame (optional, for generating GT labels)
         gt_detect_array: ground truth detect array DataFrame with columns: time, unit_id, extremum_channel (optional, for GT matching and recall calculation)
+        match_mode: matching mode, either 'per_channel_match' or 'combined_match'
+            - 'per_channel_match': cluster spikes per channel (based on extremum_channel), then match clusters to neurons (default)
+            - 'combined_match': perform unified K-means clustering on all spikes (n_train_neuron + 10 clusters), then match clusters to neurons based on channel_id
         device: device
     
     Returns:
@@ -2361,8 +2468,13 @@ def calibration_model(
     elif len(all_noise_gt_labels) == 0:
         print("Noise classifier准确率: 无GT数据，跳过计算")
     
-    # 5. Per-channel K-means clustering and matching
-    print("\n### 5. Per-channel K-means clustering and matching")
+    # 5. K-means clustering and matching
+    if match_mode == 'per_channel_match':
+        print("\n### 5. Per-channel K-means clustering and matching")
+    elif match_mode == 'combined_match':
+        print("\n### 5. Combined K-means clustering and matching")
+    else:
+        raise ValueError(f"Unknown match_mode: {match_mode}. Must be 'per_channel_match' or 'combined_match'")
     
     # Group spikes by channel (only for spikes that passed noise classifier)
     spike_channels_array = spike_channels_filtered  # (n_spikes_passed,) - channel indices for spikes that passed noise classifier
@@ -2376,190 +2488,366 @@ def calibration_model(
     noise_clusters = set()  # Set of cluster IDs that are marked as noise
     cluster_noise_spike_indices = []  # List of spike indices marked as noise
     global_cluster_id = 0  # Global cluster ID counter
+    kmeans_model = None  # Will be set based on match_mode
+    cluster_per_channel_waveforms = {}  # {cluster_id: per_channel_waveform (n_timepoints, n_channels)}
     
-    # Process each channel separately
-    for channel_idx in unique_channels:
-        # Get spikes for this channel
-        channel_mask = spike_channels_array == channel_idx
-        # channel_mask is boolean mask for spike_indices array
-        # channel_spike_indices_in_waveforms are indices into waveforms array
-        channel_spike_indices_in_waveforms = spike_indices[channel_mask]  # Indices in waveforms array
-        # channel_spike_indices_in_spike_indices are positions in spike_indices array
-        channel_spike_indices_in_spike_indices = np.where(channel_mask)[0]  # Positions in spike_indices array
-        channel_way3_features = way3_features[channel_mask]  # Features for this channel's spikes
+    if match_mode == 'combined_match':
+        # Combined match mode: unified K-means on all spikes
+        print(f"  Performing unified K-means clustering on all {len(spike_indices)} spikes...")
         
-        if len(channel_spike_indices_in_waveforms) == 0:
-            continue
+        # Calculate number of clusters: n_train_neuron + 10
+        n_train_neuron = len(train_neuron_inf)
+        n_clusters_combined = n_train_neuron + 30
+        print(f"  Number of clusters: {n_clusters_combined} (n_train_neuron={n_train_neuron} + 10)")
         
-        # Check if channel has enough spikes for clustering (minimum 30 spikes)
+        # Check if we have enough spikes for clustering
         min_spikes_for_clustering = 30
-        if len(channel_spike_indices_in_waveforms) < min_spikes_for_clustering:
-            # Not enough spikes, mark all as noise
-            channel_id_str = recording_channel_ids[channel_idx] if channel_idx < len(recording_channel_ids) else None
-            if channel_id_str is not None:
-                print(f"  Channel {channel_id_str}: {len(channel_spike_indices_in_waveforms)} spikes < {min_spikes_for_clustering}, marking as noise")
-            cluster_noise_spike_indices.extend(channel_spike_indices_in_waveforms.tolist())
-            continue
-        
-        # 1. K-means clustering (5 classes for this channel)
-        n_clusters_per_channel = 5
-        channel_kmeans = KMeans(n_clusters=n_clusters_per_channel, random_state=42, n_init=10)
-        channel_cluster_labels = channel_kmeans.fit_predict(channel_way3_features)  # (n_channel_spikes,)
-        
-        # Map local cluster IDs to global cluster IDs
-        for local_cluster_id in range(n_clusters_per_channel):
-            local_cluster_mask = channel_cluster_labels == local_cluster_id
-            local_cluster_spike_indices_in_waveforms = channel_spike_indices_in_waveforms[local_cluster_mask]
-            local_cluster_spike_indices_in_spike_indices = channel_spike_indices_in_spike_indices[local_cluster_mask]
+        if len(spike_indices) < min_spikes_for_clustering:
+            print(f"  Warning: Only {len(spike_indices)} spikes < {min_spikes_for_clustering}, marking all as noise")
+            cluster_noise_spike_indices.extend(spike_indices.tolist())
+            all_cluster_labels.fill(-1)
+        else:
+            # Perform unified K-means clustering
+            combined_kmeans = KMeans(n_clusters=n_clusters_combined, random_state=42, n_init=10)
+            all_cluster_labels = combined_kmeans.fit_predict(way3_features)  # (n_spikes_passed,)
+            kmeans_model = combined_kmeans
+            print(f"  Clustering completed: {len(np.unique(all_cluster_labels))} clusters")
             
-            if len(local_cluster_spike_indices_in_waveforms) == 0:
-                # Empty cluster, mark as noise
-                global_cluster_id_for_noise = global_cluster_id
-                noise_clusters.add(global_cluster_id_for_noise)
-                global_cluster_id += 1
+            # Map clusters to global cluster IDs (already global in combined mode)
+            global_cluster_id = n_clusters_combined
+            
+            # Match each cluster to neurons based on channel_id
+            print(f"  Matching clusters to train neurons...")
+            unique_cluster_ids = np.unique(all_cluster_labels)
+            
+            for cluster_id in unique_cluster_ids:
+                # Get spikes in this cluster
+                cluster_mask = all_cluster_labels == cluster_id
+                cluster_spike_indices_in_waveforms = spike_indices[cluster_mask]  # Indices in waveforms array
+                cluster_spike_indices_in_spike_indices = np.where(cluster_mask)[0]  # Positions in spike_indices array
+                
+                if len(cluster_spike_indices_in_waveforms) == 0:
+                    # Empty cluster, mark as noise
+                    noise_clusters.add(cluster_id)
+                    continue
+                
+                # Get waveforms for this cluster
+                cluster_waveforms_full = waveforms[cluster_spike_indices_in_waveforms]  # (n_spikes, n_channels, window_size)
+                
+                # Calculate per_channel_waveform for this cluster: (n_timepoints, n_channels)
+                # Average across all spikes in the cluster, then transpose from (n_channels, window_size) to (window_size, n_channels)
+                cluster_avg_waveform_per_channel = np.mean(cluster_waveforms_full, axis=0)  # (n_channels, window_size)
+                cluster_per_channel_waveform = cluster_avg_waveform_per_channel.T  # (window_size, n_channels) = (n_timepoints, n_channels)
+                cluster_per_channel_waveforms[cluster_id] = cluster_per_channel_waveform.astype(np.float32)
+                
+                # Try to match with each train neuron based on channel_id
+                best_match = None
+                best_score = -1
+                best_match_features = None
+                
+                for neuron_idx, neuron_row in train_neuron_inf.iterrows():
+                    train_neuron = neuron_row['Neuron']
+                    train_pos = np.array([neuron_row['position_1'], neuron_row['position_2']])
+                    train_waveform = np.asarray(neuron_row['position_waveform'], dtype=np.float32)
+                    
+                    # Get train neuron channel_id
+                    train_channel_id = neuron_row.get('channel_id', [])
+                    if not train_channel_id or len(train_channel_id) == 0:
+                        continue
+                    
+                    # Convert channel_id to clique indices
+                    train_channel_indices = []
+                    for ch_item in train_channel_id:
+                        try:
+                            if isinstance(ch_item, (int, np.integer)):
+                                ch_idx = int(ch_item)
+                                # Check if it's a valid 0-based index
+                                if 0 <= ch_idx < len(recording_channel_ids):
+                                    train_channel_indices.append(ch_idx)
+                                # If it's a 1-based index, convert to 0-based
+                                elif 1 <= ch_idx <= len(recording_channel_ids):
+                                    train_channel_indices.append(ch_idx - 1)
+                            else:
+                                ch_name_str = str(ch_item).strip()
+                                recording_channel_ids_str = [str(ch) for ch in recording_channel_ids]
+                                try:
+                                    ch_idx = recording_channel_ids_str.index(ch_name_str)
+                                    train_channel_indices.append(ch_idx)
+                                except ValueError:
+                                    try:
+                                        ch_idx = recording_channel_ids.index(ch_name_str)
+                                        train_channel_indices.append(ch_idx)
+                                    except ValueError:
+                                        continue
+                        except:
+                            continue
+                    
+                    if len(train_channel_indices) == 0:
+                        continue
+                    
+                    # Extract channels corresponding to train neuron channel_id
+                    valid_channel_id = [ch_idx for ch_idx in train_channel_indices if 0 <= ch_idx < n_channels]
+                    if len(valid_channel_id) == 0:
+                        continue
+                    
+                    # Use cluster_per_channel_waveform: (window_size, n_channels)
+                    # Extract columns corresponding to valid_channel_id
+                    cluster_per_channel_waveform = cluster_per_channel_waveforms[cluster_id]  # (window_size, n_channels)
+                    
+                    # Calculate position and waveform from average per_channel_waveform
+                    position_1, position_2, position_waveform = compute_position_waveform_from_average(
+                        cluster_per_channel_waveform, valid_channel_id, channel_positions_dict, window_size
+                    )
+                    
+                    # Calculate position distance
+                    cluster_pos = np.array([position_1, position_2])
+                    pos_distance = np.linalg.norm(cluster_pos - train_pos)
+                    if pos_distance >= position_threshold:
+                        continue
+                    
+                    # Calculate waveform similarity
+                    min_len = min(len(position_waveform), len(train_waveform))
+                    if min_len == 0:
+                        continue
+                    corr, _ = pearsonr(position_waveform[:min_len], train_waveform[:min_len])
+                    
+                    if corr < waveform_similarity_threshold:
+                        continue
+                    
+                    # Calculate comprehensive score
+                    score = corr / (1 + pos_distance / position_threshold)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = train_neuron
+                        best_match_features = {
+                            'position_1': position_1,
+                            'position_2': position_2,
+                            'position_waveform': position_waveform,
+                            'n_spikes': len(cluster_spike_indices_in_waveforms),
+                            'matched_neuron': train_neuron,
+                            'score': score,
+                            'pos_distance': pos_distance,
+                            'waveform_corr': corr,
+                        }
+                
+                # Establish mapping if best match found
+                if best_match is not None:
+                    cluster_to_neuron_mapping[cluster_id] = best_match
+                    neuron_to_clusters[best_match].append(cluster_id)
+                    cluster_features[cluster_id] = best_match_features
+                else:
+                    # No match found, mark as noise
+                    noise_clusters.add(cluster_id)
+                    cluster_noise_spike_indices.extend(cluster_spike_indices_in_waveforms.tolist())
+            
+            print(f"  Matching completed: {len(cluster_to_neuron_mapping)} clusters matched to neurons")
+    
+    elif match_mode == 'per_channel_match':
+        # Per-channel match mode: cluster spikes per channel, then match
+        # Process each channel separately
+        for channel_idx in unique_channels:
+            # Get spikes for this channel
+            channel_mask = spike_channels_array == channel_idx
+            # channel_mask is boolean mask for spike_indices array
+            # channel_spike_indices_in_waveforms are indices into waveforms array
+            channel_spike_indices_in_waveforms = spike_indices[channel_mask]  # Indices in waveforms array
+            # channel_spike_indices_in_spike_indices are positions in spike_indices array
+            channel_spike_indices_in_spike_indices = np.where(channel_mask)[0]  # Positions in spike_indices array
+            channel_way3_features = way3_features[channel_mask]  # Features for this channel's spikes
+            
+            if len(channel_spike_indices_in_waveforms) == 0:
                 continue
             
-            global_cluster_id_current = global_cluster_id
-            global_cluster_id += 1
+            # Check if channel has enough spikes for clustering (minimum 30 spikes)
+            min_spikes_for_clustering = 30
+            if len(channel_spike_indices_in_waveforms) < min_spikes_for_clustering:
+                # Not enough spikes, mark all as noise
+                channel_id_str = recording_channel_ids[channel_idx] if channel_idx < len(recording_channel_ids) else None
+                if channel_id_str is not None:
+                    print(f"  Channel {channel_id_str}: {len(channel_spike_indices_in_waveforms)} spikes < {min_spikes_for_clustering}, marking as noise")
+                cluster_noise_spike_indices.extend(channel_spike_indices_in_waveforms.tolist())
+                continue
             
-            # Update global cluster labels
-            # local_cluster_spike_indices_in_spike_indices are positions in spike_indices array
-            all_cluster_labels[local_cluster_spike_indices_in_spike_indices] = global_cluster_id_current
-        
-        # 2. Match clusters to neurons with matching extremum_channel
-        # Find neurons with extremum_channel matching this channel
-        channel_id_str = recording_channel_ids[channel_idx] if channel_idx < len(recording_channel_ids) else None
-        
-        if channel_id_str is None:
-            continue
-        
-        # Find neurons with this extremum_channel
-        matching_neurons = train_neuron_inf[train_neuron_inf['extremum_channel'] == channel_id_str]
-        
-        if len(matching_neurons) == 0:
-            # No matching neurons for this channel, mark all spikes as noise
+            # 1. K-means clustering (5 classes for this channel)
+            n_clusters_per_channel = 10
+            channel_kmeans = KMeans(n_clusters=n_clusters_per_channel, random_state=42, n_init=10)
+            channel_cluster_labels = channel_kmeans.fit_predict(channel_way3_features)  # (n_channel_spikes,)
+            
+            # Map local cluster IDs to global cluster IDs
             for local_cluster_id in range(n_clusters_per_channel):
                 local_cluster_mask = channel_cluster_labels == local_cluster_id
                 local_cluster_spike_indices_in_waveforms = channel_spike_indices_in_waveforms[local_cluster_mask]
-                if len(local_cluster_spike_indices_in_waveforms) > 0:
-                    cluster_noise_spike_indices.extend(local_cluster_spike_indices_in_waveforms.tolist())
-            continue
-        
-        # For each cluster in this channel, try to match with neurons
-        for local_cluster_id in range(n_clusters_per_channel):
-            local_cluster_mask = channel_cluster_labels == local_cluster_id
-            local_cluster_spike_indices_in_waveforms = channel_spike_indices_in_waveforms[local_cluster_mask]
-            local_cluster_spike_indices_in_spike_indices = channel_spike_indices_in_spike_indices[local_cluster_mask]
-            
-            if len(local_cluster_spike_indices_in_waveforms) == 0:
-                continue
-            
-            # Get global cluster ID
-            # Use the first spike's position in spike_indices array to get global cluster ID
-            if len(local_cluster_spike_indices_in_spike_indices) == 0:
-                continue
-            global_cluster_id_current = all_cluster_labels[local_cluster_spike_indices_in_spike_indices[0]]
-            
-            if global_cluster_id_current == -1:
-                continue
-            
-            # Get waveforms for this cluster
-            cluster_waveforms_full = waveforms[local_cluster_spike_indices_in_waveforms]  # (n_spikes, n_channels, window_size)
-            
-            # Try to match with each neuron
-            best_match = None
-            best_score = -1
-            best_match_features = None
-            
-            for neuron_idx, neuron_row in matching_neurons.iterrows():
-                train_neuron = neuron_row['Neuron']
-                train_pos = np.array([neuron_row['position_1'], neuron_row['position_2']])
-                train_waveform = np.asarray(neuron_row['position_waveform'], dtype=np.float32)
+                local_cluster_spike_indices_in_spike_indices = channel_spike_indices_in_spike_indices[local_cluster_mask]
                 
-                # Get train neuron channel_id
-                train_channel_id = neuron_row.get('channel_id', [])
-                if not train_channel_id or len(train_channel_id) == 0:
+                if len(local_cluster_spike_indices_in_waveforms) == 0:
+                    # Empty cluster, mark as noise
+                    global_cluster_id_for_noise = global_cluster_id
+                    noise_clusters.add(global_cluster_id_for_noise)
+                    global_cluster_id += 1
                     continue
                 
-                # Convert channel_id to clique indices
-                train_channel_indices = []
-                for ch_item in train_channel_id:
-                    try:
-                        if isinstance(ch_item, (int, np.integer)):
-                            ch_idx = int(ch_item)
-                            if 0 <= ch_idx < len(recording_channel_ids):
-                                train_channel_indices.append(ch_idx)
-                        else:
-                            ch_name_str = str(ch_item).strip()
-                            recording_channel_ids_str = [str(ch) for ch in recording_channel_ids]
-                            try:
-                                ch_idx = recording_channel_ids_str.index(ch_name_str)
-                                train_channel_indices.append(ch_idx)
-                            except ValueError:
+                global_cluster_id_current = global_cluster_id
+                global_cluster_id += 1
+                
+                # Update global cluster labels
+                # local_cluster_spike_indices_in_spike_indices are positions in spike_indices array
+                all_cluster_labels[local_cluster_spike_indices_in_spike_indices] = global_cluster_id_current
+            
+            # 2. Match clusters to neurons with matching extremum_channel
+            # Find neurons with extremum_channel matching this channel
+            channel_id_str = recording_channel_ids[channel_idx] if channel_idx < len(recording_channel_ids) else None
+            
+            if channel_id_str is None:
+                continue
+            
+            # Find neurons with this extremum_channel
+            matching_neurons = train_neuron_inf[train_neuron_inf['extremum_channel'] == channel_id_str]
+            
+            if len(matching_neurons) == 0:
+                # No matching neurons for this channel, mark all spikes as noise
+                # But still calculate per_channel_waveform for these clusters
+                for local_cluster_id in range(n_clusters_per_channel):
+                    local_cluster_mask = channel_cluster_labels == local_cluster_id
+                    local_cluster_spike_indices_in_waveforms = channel_spike_indices_in_waveforms[local_cluster_mask]
+                    if len(local_cluster_spike_indices_in_waveforms) > 0:
+                        # Get waveforms for this cluster
+                        cluster_waveforms_full_no_match = waveforms[local_cluster_spike_indices_in_waveforms]  # (n_spikes, n_channels, window_size)
+                        # Calculate per_channel_waveform
+                        cluster_avg_waveform_per_channel = np.mean(cluster_waveforms_full_no_match, axis=0)  # (n_channels, window_size)
+                        cluster_per_channel_waveform = cluster_avg_waveform_per_channel.T  # (window_size, n_channels) = (n_timepoints, n_channels)
+                        # Get global cluster ID for this local cluster
+                        local_cluster_spike_indices_in_spike_indices = channel_spike_indices_in_spike_indices[local_cluster_mask]
+                        if len(local_cluster_spike_indices_in_spike_indices) > 0:
+                            global_cluster_id_for_no_match = all_cluster_labels[local_cluster_spike_indices_in_spike_indices[0]]
+                            if global_cluster_id_for_no_match >= 0:
+                                cluster_per_channel_waveforms[global_cluster_id_for_no_match] = cluster_per_channel_waveform.astype(np.float32)
+                        cluster_noise_spike_indices.extend(local_cluster_spike_indices_in_waveforms.tolist())
+                continue
+            
+            # For each cluster in this channel, try to match with neurons
+            for local_cluster_id in range(n_clusters_per_channel):
+                local_cluster_mask = channel_cluster_labels == local_cluster_id
+                local_cluster_spike_indices_in_waveforms = channel_spike_indices_in_waveforms[local_cluster_mask]
+                local_cluster_spike_indices_in_spike_indices = channel_spike_indices_in_spike_indices[local_cluster_mask]
+                
+                if len(local_cluster_spike_indices_in_waveforms) == 0:
+                    continue
+                
+                # Get global cluster ID
+                # Use the first spike's position in spike_indices array to get global cluster ID
+                if len(local_cluster_spike_indices_in_spike_indices) == 0:
+                    continue
+                global_cluster_id_current = all_cluster_labels[local_cluster_spike_indices_in_spike_indices[0]]
+                
+                if global_cluster_id_current == -1:
+                    continue
+                
+                # Get waveforms for this cluster
+                cluster_waveforms_full = waveforms[local_cluster_spike_indices_in_waveforms]  # (n_spikes, n_channels, window_size)
+                
+                # Calculate per_channel_waveform for this cluster: (n_timepoints, n_channels)
+                # Average across all spikes in the cluster, then transpose from (n_channels, window_size) to (window_size, n_channels)
+                cluster_avg_waveform_per_channel = np.mean(cluster_waveforms_full, axis=0)  # (n_channels, window_size)
+                cluster_per_channel_waveform = cluster_avg_waveform_per_channel.T  # (window_size, n_channels) = (n_timepoints, n_channels)
+                cluster_per_channel_waveforms[global_cluster_id_current] = cluster_per_channel_waveform.astype(np.float32)
+                
+                # Try to match with each neuron
+                best_match = None
+                best_score = -1
+                best_match_features = None
+                
+                for neuron_idx, neuron_row in matching_neurons.iterrows():
+                    train_neuron = neuron_row['Neuron']
+                    train_pos = np.array([neuron_row['position_1'], neuron_row['position_2']])
+                    train_waveform = np.asarray(neuron_row['position_waveform'], dtype=np.float32)
+                    
+                    # Get train neuron channel_id
+                    train_channel_id = neuron_row.get('channel_id', [])
+                    if not train_channel_id or len(train_channel_id) == 0:
+                        continue
+                    
+                    # Convert channel_id to clique indices
+                    train_channel_indices = []
+                    for ch_item in train_channel_id:
+                        try:
+                            if isinstance(ch_item, (int, np.integer)):
+                                ch_idx = int(ch_item)
+                                if 0 <= ch_idx < len(recording_channel_ids):
+                                    train_channel_indices.append(ch_idx)
+                            else:
+                                ch_name_str = str(ch_item).strip()
+                                recording_channel_ids_str = [str(ch) for ch in recording_channel_ids]
                                 try:
-                                    ch_idx = recording_channel_ids.index(ch_name_str)
+                                    ch_idx = recording_channel_ids_str.index(ch_name_str)
                                     train_channel_indices.append(ch_idx)
                                 except ValueError:
-                                    continue
-                    except:
+                                    try:
+                                        ch_idx = recording_channel_ids.index(ch_name_str)
+                                        train_channel_indices.append(ch_idx)
+                                    except ValueError:
+                                        continue
+                        except:
+                            continue
+                    
+                    if len(train_channel_indices) == 0:
                         continue
+                    
+                    # Extract channels corresponding to train neuron channel_id
+                    valid_channel_id = [ch_idx for ch_idx in train_channel_indices if 0 <= ch_idx < n_channels]
+                    if len(valid_channel_id) == 0:
+                        continue
+                    
+                    # Use cluster_per_channel_waveform: (window_size, n_channels)
+                    # Extract columns corresponding to valid_channel_id
+                    cluster_per_channel_waveform = cluster_per_channel_waveforms[global_cluster_id_current]  # (window_size, n_channels)
+                    
+                    # Calculate position and waveform from average per_channel_waveform
+                    position_1, position_2, position_waveform = compute_position_waveform_from_average(
+                        cluster_per_channel_waveform, valid_channel_id, channel_positions_dict, window_size
+                    )
+                    
+                    # Calculate position distance
+                    cluster_pos = np.array([position_1, position_2])
+                    pos_distance = np.linalg.norm(cluster_pos - train_pos)
+                    if pos_distance >= position_threshold:
+                        continue
+                    
+                    # Calculate waveform similarity
+                    min_len = min(len(position_waveform), len(train_waveform))
+                    if min_len == 0:
+                        continue
+                    corr, _ = pearsonr(position_waveform[:min_len], train_waveform[:min_len])
+                    
+                    if corr < waveform_similarity_threshold:
+                        continue
+                    
+                    # Calculate comprehensive score
+                    score = corr / (1 + pos_distance / position_threshold)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = train_neuron
+                        best_match_features = {
+                            'position_1': position_1,
+                            'position_2': position_2,
+                            'position_waveform': position_waveform,
+                            'n_spikes': len(local_cluster_spike_indices_in_waveforms),
+                            'matched_neuron': train_neuron,
+                            'score': score,
+                            'pos_distance': pos_distance,
+                            'waveform_corr': corr,
+                        }
                 
-                if len(train_channel_indices) == 0:
-                    continue
-                
-                # Extract channels corresponding to train neuron channel_id
-                valid_channel_id = [ch_idx for ch_idx in train_channel_indices if 0 <= ch_idx < n_channels]
-                if len(valid_channel_id) == 0:
-                    continue
-                
-                cluster_waveforms = cluster_waveforms_full[:, valid_channel_id, :]  # (n_spikes, n_valid_channels, window_size)
-                
-                # Calculate position and waveform
-                position_1, position_2, position_waveform = compute_cluster_position_waveform(
-                    cluster_waveforms, valid_channel_id, channel_positions_dict, window_size
-                )
-                
-                # Calculate position distance
-                cluster_pos = np.array([position_1, position_2])
-                pos_distance = np.linalg.norm(cluster_pos - train_pos)
-                if pos_distance >= position_threshold:
-                    continue
-                
-                # Calculate waveform similarity
-                min_len = min(len(position_waveform), len(train_waveform))
-                if min_len == 0:
-                    continue
-                corr, _ = pearsonr(position_waveform[:min_len], train_waveform[:min_len])
-                
-                if corr < waveform_similarity_threshold:
-                    continue
-                
-                # Calculate comprehensive score
-                score = corr / (1 + pos_distance / position_threshold)
-                
-                if score > best_score:
-                    best_score = score
-                    best_match = train_neuron
-                    best_match_features = {
-                        'position_1': position_1,
-                        'position_2': position_2,
-                        'position_waveform': position_waveform,
-                        'n_spikes': len(local_cluster_spike_indices_in_waveforms),
-                        'matched_neuron': train_neuron,
-                        'score': score,
-                        'pos_distance': pos_distance,
-                        'waveform_corr': corr,
-                    }
-            
-            # Establish mapping if best match found
-            if best_match is not None:
-                cluster_to_neuron_mapping[global_cluster_id_current] = best_match
-                neuron_to_clusters[best_match].append(global_cluster_id_current)
-                cluster_features[global_cluster_id_current] = best_match_features
-            else:
-                # No match found, mark as noise
-                noise_clusters.add(global_cluster_id_current)
-                cluster_noise_spike_indices.extend(local_cluster_spike_indices_in_waveforms.tolist())
+                # Establish mapping if best match found
+                if best_match is not None:
+                    cluster_to_neuron_mapping[global_cluster_id_current] = best_match
+                    neuron_to_clusters[best_match].append(global_cluster_id_current)
+                    cluster_features[global_cluster_id_current] = best_match_features
+                else:
+                    # No match found, mark as noise
+                    noise_clusters.add(global_cluster_id_current)
+                    cluster_noise_spike_indices.extend(local_cluster_spike_indices_in_waveforms.tolist())
     
     # Use all_cluster_labels as cluster_labels for compatibility
     cluster_labels = all_cluster_labels
@@ -2613,7 +2901,10 @@ def calibration_model(
         print(f"  Marked {n_invalid_clusters} clusters and {n_invalid_spikes} spikes as noise due to low firing rate")
     
     print("\n### 7. Summary")
-    n_total_clusters = global_cluster_id
+    if match_mode == 'combined_match':
+        n_total_clusters = len(np.unique(all_cluster_labels[all_cluster_labels >= 0])) if len(all_cluster_labels) > 0 else 0
+    else:
+        n_total_clusters = global_cluster_id
     n_noise_spikes = len(cluster_noise_spike_indices)
     n_spikes_matched = len(spike_indices) - n_noise_spikes
     print(f"Matching results:")
@@ -2847,10 +3138,11 @@ def calibration_model(
         n_new_neurons = len(eval_neuron_ids - train_neuron_ids)  # 新出现的神经元数
     
     calibration_results = {
-        'kmeans_model': None,  # Per-channel kmeans models (not stored globally)
+        'kmeans_model': kmeans_model,  # K-means model (None for per-channel mode, actual model for combined mode)
         'cluster_to_neuron_mapping': cluster_to_neuron_mapping,
         'neuron_to_clusters': dict(neuron_to_clusters),
         'cluster_features': cluster_features,
+        'cluster_per_channel_waveforms': cluster_per_channel_waveforms,  # {cluster_id: per_channel_waveform (n_timepoints, n_channels)}
         'spike_indices': spike_indices,
         'cluster_labels': cluster_labels,
         'noise_spike_indices': np.array(cluster_noise_spike_indices) if len(cluster_noise_spike_indices) > 0 else np.array([], dtype=np.int64),  # Spikes marked as noise
