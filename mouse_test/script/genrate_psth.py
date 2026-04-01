@@ -170,28 +170,22 @@ for clique_name, clique_date_dir in clique_dirs:
 
 
 # %%
-import neo
-from elephant.kernels import GaussianKernel
-from elephant.statistics import instantaneous_rate
-from quantities import ms
+# 计算firing rate反应矩阵 (n_trial, n_neuron)
+# 参考 generate_psth.ipynb 的方法，计算指定时间窗口内的firing rate
 
-# PSTH参数设置
-gk = GaussianKernel(25 * ms)  # 25ms的Gaussian kernel
-bin_size_ms = 10  # 10ms的bin size
-bin_size_s = bin_size_ms / 1000.0
+# 时间窗口参数（相对于trial开始时间）
+window_start_ms = 50  # 50ms
+window_end_ms = 200   # 200ms
+window_start_s = window_start_ms / 1000.0  # 0.05秒
+window_end_s = window_end_ms / 1000.0      # 0.2秒
+window_duration_s = window_end_s - window_start_s  # 0.15秒
 
-# 计算时间轴（使用extended时间窗）
-total_time_extended = EXTEND_TIME + STIMULUS_DURATION + EXTEND_TIME  # 0.45秒（如果EXTEND_TIME=0.1）
-time_bins = np.arange(0, total_time_extended, bin_size_s)
-n_time_bins = len(time_bins)
+print(f"\n{'='*60}")
+print("计算firing rate反应矩阵 (50ms-200ms时间窗口)")
+print(f"{'='*60}")
+print(f"时间窗口: {window_start_ms}ms - {window_end_ms}ms ({window_duration_s*1000:.0f}ms)")
 
-print(f"PSTH参数:")
-print(f"  Total time: {total_time_extended} s")
-print(f"  Bin size: {bin_size_ms} ms")
-print(f"  Number of time bins: {n_time_bins}")
-
-# 收集所有trials和neurons的PSTH
-# 首先获取所有trials和所有neurons
+# 收集所有trials和neurons
 all_trials = trigger_log.copy().reset_index(drop=True)
 n_trials = len(all_trials)
 
@@ -220,12 +214,12 @@ n_neurons = len(all_neuron_keys)
 print(f"\n找到 {n_trials} 个trials")
 print(f"找到 {n_neurons} 个neurons")
 
-# 初始化PSTH矩阵: (n_trial, n_time_bins, n_neuron)
-psth_matrix = np.zeros((n_trials, n_time_bins, n_neurons))
+# 初始化firing rate矩阵: (n_trial, n_neuron)
+firing_rate_matrix = np.zeros((n_trials, n_neurons))
 trial_image_id = []
 
-print(f"\n开始计算PSTH...")
-print(f"矩阵形状: ({n_trials}, {n_time_bins}, {n_neurons})")
+print(f"\n开始计算firing rate矩阵...")
+print(f"矩阵形状: ({n_trials}, {n_neurons})")
 
 # 遍历所有trials
 for trial_idx, (_, trial) in enumerate(all_trials.iterrows()):
@@ -236,56 +230,37 @@ for trial_idx, (_, trial) in enumerate(all_trials.iterrows()):
     image_id = trial.get('image', 'unknown')
     trial_image_id.append(image_id)
     
-    start_ext = int(trial['start_extended'])
-    end_ext = int(trial['end_extended'])
+    # 计算时间窗口（相对于trial开始时间）
+    # trial的开始时间是trigger的start_index（10kHz采样率）
+    trial_start = int(trial['start_index'])
+    
+    # 计算时间窗口的起始和结束采样点
+    window_start_sample = trial_start + int(window_start_s * SAMPLING_RATE)
+    window_end_sample = trial_start + int(window_end_s * SAMPLING_RATE)
     
     # 遍历所有neurons
     for neuron_idx, neuron_key in enumerate(all_neuron_keys):
         neuron_spikes = all_neuron_spike_data[neuron_key]
         
-        # 获取该trial内的spikes
-        trial_spikes = neuron_spikes[(neuron_spikes >= start_ext) & (neuron_spikes <= end_ext)]
+        # 获取时间窗口内的spikes
+        window_spikes = neuron_spikes[
+            (neuron_spikes >= window_start_sample) & 
+            (neuron_spikes < window_end_sample)
+        ]
         
-        if len(trial_spikes) > 0:
-            # 转换为相对时间（秒）
-            relative_spikes = (trial_spikes - start_ext) / SAMPLING_RATE
-            
-            # 创建SpikeTrain对象
-            spiketrain = neo.SpikeTrain(
-                relative_spikes * 1000 * ms, 
-                t_stop=total_time_extended * 1000 * ms, 
-                t_start=0 * ms
-            )
-            
-            # 计算instantaneous rate
-            inst_rate = instantaneous_rate(spiketrain, kernel=gk, sampling_period=bin_size_ms * ms)
-            psth_trial = inst_rate.magnitude.flatten()
-        else:
-            psth_trial = np.zeros(n_time_bins)
-        
-        # 确保长度一致
-        if len(psth_trial) < n_time_bins:
-            psth_trial = np.pad(psth_trial, (0, n_time_bins - len(psth_trial)), 'constant')
-        elif len(psth_trial) > n_time_bins:
-            psth_trial = psth_trial[:n_time_bins]
-        
-        # 存储到矩阵中
-        psth_matrix[trial_idx, :, neuron_idx] = psth_trial
+        # 计算firing rate (spikes per second)
+        spike_count = len(window_spikes)
+        firing_rate = spike_count / window_duration_s
+        firing_rate_matrix[trial_idx, neuron_idx] = firing_rate
 
-print(f"\n完成! PSTH矩阵形状: {psth_matrix.shape}")
-print(f"Trial image ID列表长度: {len(trial_image_id)}")
 
 # 保存结果
-psth_output_path = os.path.join(OUTPUT_DIR, "psth_matrix.npy")
+firing_rate_output_path = os.path.join(OUTPUT_DIR, "firing_rate_50ms_200ms.npy")
 trial_image_output_path = os.path.join(OUTPUT_DIR, "trial_image_id.pkl")
 
-np.save(psth_output_path, psth_matrix)
+np.save(firing_rate_output_path, firing_rate_matrix)
 with open(trial_image_output_path, 'wb') as f:
     pickle.dump(trial_image_id, f)
-
-print(f"\n已保存:")
-print(f"  PSTH矩阵: {psth_output_path}")
-print(f"  Trial image ID: {trial_image_output_path}")
 
 
 

@@ -43,7 +43,7 @@ def find_all_images(root_dir):
     print(f"找到 {len(image_paths)} 张图片")
     return image_paths
 
-def preprocess_image_for_clip(image_path, size=224):
+def preprocess_image_for_clip(image_path, clip_preprocess, size=224):
     """预处理图像用于CLIP"""
     try:
         img = Image.open(image_path).convert('RGB')
@@ -94,7 +94,7 @@ def extract_clip_features_batch(image_paths, clip_model, clip_preprocess, device
         # 预处理当前batch的图片
         for idx, img_path in enumerate(batch_paths):
             try:
-                img_tensor = preprocess_image_for_clip(img_path, size=IMAGE_SIZE)
+                img_tensor = preprocess_image_for_clip(img_path, clip_preprocess, size=IMAGE_SIZE)
                 batch_images.append(img_tensor)
                 batch_valid_indices.append(idx)
             except Exception as e:
@@ -136,9 +136,11 @@ def extract_clip_features_batch(image_paths, clip_model, clip_preprocess, device
                             existing = np.load(output_features_path)
                             combined = np.vstack([existing, features_chunk])
                             np.save(output_features_path, combined)
+                            final_shape = combined.shape
                         else:
                             # 首次保存
                             np.save(output_features_path, features_chunk)
+                            final_shape = features_chunk.shape
                         
                         # 同时保存路径列表
                         if output_paths_path:
@@ -146,7 +148,7 @@ def extract_clip_features_batch(image_paths, clip_model, clip_preprocess, device
                                 for path in valid_paths:
                                     f.write(f"{path}\n")
                         
-                        print(f"\n已保存中间结果: {processed_count} 张图片，特征矩阵形状: {combined.shape if os.path.exists(output_features_path) else features_chunk.shape}")
+                        print(f"\n已保存中间结果: {processed_count} 张图片，特征矩阵形状: {final_shape}")
                     # 清空内存
                     all_features = []
                     
@@ -178,12 +180,20 @@ def extract_clip_features_batch(image_paths, clip_model, clip_preprocess, device
         return None, []
 
 def main():
-    # 检查设备
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"使用设备: {device}")
+    # 检查设备 - 强制使用CUDA
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA不可用！请检查：\n"
+            "1. 是否正确安装了支持CUDA的PyTorch版本\n"
+            "2. 是否正确安装了NVIDIA驱动\n"
+            "3. 运行命令: python -c 'import torch; print(torch.cuda.is_available())' 检查CUDA状态\n"
+            "如果确实无法使用CUDA，请修改代码中的device设置"
+        )
     
-    if device == 'cpu':
-        print("警告: 使用CPU处理，速度会很慢。建议使用GPU。")
+    device = 'cuda'
+    print(f"使用设备: {device} (GPU)")
+    print(f"CUDA设备: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA版本: {torch.version.cuda}")
     
     # 加载CLIP模型
     print("正在加载CLIP模型...")
@@ -193,6 +203,7 @@ def main():
     if not os.path.exists(checkpoint_path):
         possible_paths = [
             '/media/ubuntu/sda/visual_stimuli_pattern/ViT-L-14.pt',
+            '/disk1/jinchentao/visual_decode/visual_reconstruction/VAR-CLIP-master/ViT-L-14.pt',
         ]
         for path in possible_paths:
             if os.path.exists(path):
@@ -203,8 +214,26 @@ def main():
         raise FileNotFoundError(f"找不到CLIP模型文件。请确保ViT-L-14.pt文件存在。尝试过的路径: {checkpoint_path}")
     
     print(f"加载CLIP模型: {checkpoint_path}")
+    # TorchScript模型先加载到CPU，然后转移到CUDA
     clip_model = torch.jit.load(checkpoint_path, map_location='cpu')
-    clip_model = clip_model.to(device)
+    
+    # 转移到CUDA设备
+    try:
+        clip_model = clip_model.to(device)
+        # 测试模型是否正常工作
+        test_input = torch.randn(1, 3, 224, 224).to(device)
+        with torch.no_grad():
+            _ = clip_model.encode_image(test_input)
+        print("✓ CLIP模型加载成功并已转移到CUDA")
+    except Exception as e:
+        raise RuntimeError(
+            f"无法将CLIP模型转移到CUDA设备: {e}\n"
+            "这可能是因为：\n"
+            "1. PyTorch版本与CUDA版本不匹配\n"
+            "2. TorchScript模型与当前PyTorch版本不兼容\n"
+            "请检查PyTorch和CUDA版本是否匹配"
+        ) from e
+    
     clip_model.eval()
     
     # 获取预处理器

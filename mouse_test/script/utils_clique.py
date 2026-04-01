@@ -915,6 +915,7 @@ def prepare_training_data(
     
     # Deduplicate spikes: for each neuron, if both extremum_channel and second-max-SNR channel
     # detect spikes at the same time point, keep the spike with larger amplitude
+    detect_array_before_dedup = detect_array.copy()
     if 'extremum_channel' in neuron_inf.columns and 'channel_snr' in neuron_inf.columns:
         recording_channel_ids = list(recording_f.get_channel_ids())
         detect_array = deduplicate_spikes_by_neuron_channels(
@@ -924,22 +925,15 @@ def prepare_training_data(
         X_spiketrain_time = detect_array[:, 0]
         Y_spiketrain_id_final = detect_array[:, 1]
     
+    print(f"Number of detected spikes after deduplication: {len(detect_array)}")
+    
     print("\n### 2. Load Ground Truth and Match")
     
     # Build gt_array directly from gt_detect_array
-    # gt_detect_array has columns: time (seconds), unit_id, extremum_channel
-    print("Building gt_array from gt_detect_array...")
-    
-    # Convert time from seconds to sample indices
+    # gt_detect_array has columns: time (sample points, not seconds!), unit_id, extremum_channel
+    # Note: gt_detect_array['time'] is already in sample points (not seconds)
     sampling_rate = recording_f.get_sampling_frequency()
     gt_detect_array_filtered = gt_detect_array[gt_detect_array['time'] < max_frames].copy()
-    print(f"Filtered gt_detect_array: {len(gt_detect_array_filtered)} spikes (out of {len(gt_detect_array)} total)")
-    
-    # Debug: print probe_to_clique_index keys and sample extremum_channels
-    print(f"Recording clique channel IDs (keys in probe_to_clique_index): {list(probe_to_clique_index.keys())[:10]}...")
-    if len(gt_detect_array_filtered) > 0:
-        sample_extremum_channels = gt_detect_array_filtered['extremum_channel'].dropna().unique()[:10]
-        print(f"Sample extremum_channels from gt_detect_array: {list(sample_extremum_channels)}")
     
     # Build mapping from extremum_channel to clique column index
     spike_train_all = []
@@ -951,10 +945,10 @@ def prepare_training_data(
     for pos_idx, (_, row) in enumerate(gt_detect_array_filtered.iterrows()):
         extremum_channel = row['extremum_channel']
         unit_id = row['unit_id']
-        spike_time_seconds = row['time']
+        spike_time_sample_points = row['time']  # Already in sample points
         
-        # Convert time from seconds to sample indices
-        spike_time_sample = int(spike_time_seconds)
+        # Time is already in sample points, just convert to int
+        spike_time_sample = int(spike_time_sample_points)
         
         # Map extremum_channel (original probe channel ID) to clique column index
         if pd.isna(extremum_channel) or extremum_channel is None:
@@ -981,9 +975,6 @@ def prepare_training_data(
         gt_ch.append(clique_channel_index)  # 使用clique列索引
     
     gt_array = np.array([spike_train_all, gt_ch]).T if len(spike_train_all) > 0 else np.array([]).reshape(0, 2)
-    print(f"GT spike count: {len(gt_array)}")
-    if skipped_count > 0:
-        print(f"Skipped {skipped_count} spikes: {skipped_reasons}")
     
     # Check if gt_array is empty
     if len(gt_array) == 0:
@@ -997,9 +988,12 @@ def prepare_training_data(
     # Use AutoSort's map_gt_annotation function
     gt_label_array1 = map_gt_annotation(detect_array, gt_array)
     
-    # Calculate detection rate
-    detection_rate = np.where(gt_label_array1 > -1)[0].shape[0] / gt_array.shape[0]
-    print(f"---spike detection rate: {detection_rate:.4f}")
+    # Calculate GT matching statistics (same format as calibration_model)
+    matched_gt_indices = set(gt_label_array1[gt_label_array1 >= 0])
+    matched_gt_count = len(matched_gt_indices)
+    gt_total_count = len(gt_array)
+    recall_rate = matched_gt_count / gt_total_count if gt_total_count > 0 else 0
+    print(f"GT匹配统计: {matched_gt_count}/{gt_total_count} GT spikes被检测到 (召回率: {recall_rate:.4f})")
     
     # Build Y_spiketrain_id
     Y_spiketrain_id = np.full((detect_array.shape[0],), None, dtype=object)
@@ -1009,9 +1003,6 @@ def prepare_training_data(
         Y_spiketrain_id[matched_indices] = y_unit_id_array[
             gt_label_array1[matched_indices].astype("int")
         ]
-    
-    print(f"Number of matched spikes: {len(matched_indices)}")
-    print(f"Number of unmatched spikes: {len(detect_array) - len(matched_indices)}")
     
     print("\n### 3. Extract Waveforms")
     
@@ -1655,6 +1646,7 @@ def train_autosort_model(
     min_delta=0.0,
     use_focal_loss=True,
     focal_gamma=2.0,
+    keep_id=None,
 ):
     """
     Train AutoSort model
@@ -1672,6 +1664,7 @@ def train_autosort_model(
         min_delta: minimum change for early stopping, default 0.0
         use_focal_loss: whether to use Focal Loss for noise classification, default True
         focal_gamma: Focal Loss gamma parameter, default 2.0
+        keep_id: list of unit IDs to keep (if None, auto-extract from data)
     
     Returns:
         autosort_model: trained model
@@ -1689,10 +1682,16 @@ def train_autosort_model(
     
     # Create dataset
     print("Create dataset...")
+    if keep_id is not None:
+        print(f"Using provided keep_id: {len(keep_id)} units")
+        print(f"  keep_id: {keep_id}")
+    else:
+        print("Auto-extracting keep_id from data")
+    
     dataset = SimpleWaveformLoader(
         root=str(train_data_dir) + '/',
         shank_channel=np.arange(n_channels),
-        Keep_id=None
+        Keep_id=keep_id  # 使用传入的keep_id，如果为None则自动提取
     )
     
     set_shank_id = dataset.keep_id
